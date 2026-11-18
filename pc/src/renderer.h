@@ -3,6 +3,7 @@
 #include <dxgi1_2.h>
 #include <wrl/client.h>
 
+#include <atomic>
 #include <mutex>
 
 struct AVFrame;
@@ -18,6 +19,8 @@ public:
     void upload(const AVFrame* frame);  // çözücünün dokusunu kendi dokumuza kopyalar (GPU içi)
     void draw();
     void resize(UINT width, UINT height);
+    // Bağlantı yokken son kareyi karartılmış göster (her thread'den çağrılabilir)
+    void set_dimmed(bool dimmed) { dimmed_ = dimmed; }
 
 private:
     bool create_rtv();
@@ -35,6 +38,7 @@ private:
     ComPtr<ID3D11ShaderResourceView> srv_y_, srv_uv_;
 
     std::recursive_mutex lock_;
+    std::atomic<bool> dimmed_{false};
     bool tearing_ = false;
     UINT swap_flags_ = 0;
     UINT bb_w_ = 0, bb_h_ = 0;
@@ -47,5 +51,7 @@ private:
         float y_offset;
         float y_scale;
         float coef[4];  // R=Cr*c0, G=-Cb*c1-Cr*c2, B=Cb*c3
+        float brightness;
+        float pad[3];
     } consts_{};
 };

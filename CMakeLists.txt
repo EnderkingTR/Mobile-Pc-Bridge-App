@@ -20,13 +20,15 @@ add_executable(kopru
     pc/src/control_msg.cpp
     pc/src/decoder.cpp
     pc/src/renderer.cpp
+    pc/src/settings.cpp
+    pc/src/transfer.cpp
 )
 
 target_include_directories(kopru SYSTEM PRIVATE "${FFMPEG_DIR}/include")
 target_link_libraries(kopru PRIVATE
     "${FFMPEG_DIR}/lib/avcodec.lib"
     "${FFMPEG_DIR}/lib/avutil.lib"
-    d3d11 dxgi dxguid d3dcompiler ws2_32
+    d3d11 dxgi dxguid d3dcompiler ws2_32 comdlg32 shell32
 )
 target_compile_definitions(kopru PRIVATE
     UNICODE _UNICODE NOMINMAX WIN32_LEAN_AND_MEAN

@@ -19,6 +19,7 @@ enum Type : uint8_t {
     SET_CLIPBOARD = 9,
     SET_DISPLAY_POWER = 10,
     ROTATE_DEVICE = 11,
+    SCAN_FILE = 22,  // telefona gönderilen dosyayı galeride/medyada görünür yap
 };
 
 // Android sabitleri
@@ -51,5 +52,6 @@ std::vector<uint8_t> simple(Type type);  // paneller, döndürme
 std::vector<uint8_t> get_clipboard(uint8_t copy_key);
 std::vector<uint8_t> set_clipboard(uint64_t sequence, const std::string& utf8, bool paste);
 std::vector<uint8_t> set_display_power(bool on);
+std::vector<uint8_t> scan_file(const std::string& device_path);
 
 }  // namespace ctrl

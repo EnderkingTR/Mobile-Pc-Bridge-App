@@ -1,13 +1,17 @@
 // Köprü — Android ekranını PC'de düşük gecikmeyle gösterir ve kontrol eder.
 //
 // Thread yapısı:
-//   ana thread    : Win32 pencere, fare/klavye -> kontrol mesajları
-//   video thread  : soketten paket okur, D3D11VA ile çözer, en yeni kareyi render kuyruğuna koyar
-//   render thread : kareyi çizer (eski kareler beklemeden atılır = düşük gecikme)
-//   mesaj thread  : telefondan gelen pano (clipboard) mesajları
+//   ana thread      : Win32 pencere, fare/klavye -> kontrol mesajları
+//   bağlantı thread : telefonu bekler, bağlanır, video paketlerini okuyup D3D11VA ile çözer,
+//                     bağlantı koparsa baştan dener (otomatik yeniden bağlanma)
+//   render thread   : kareyi çizer (eski kareler beklemeden atılır = düşük gecikme)
+//   mesaj thread    : telefondan gelen pano (clipboard) mesajları (her oturumda yeniden)
+//   aktarım thread'i: sürükle-bırak ile dosya gönderme / APK kurma
 #include "session.h"
 
 #include <windowsx.h>
+#include <commdlg.h>
+#include <shellapi.h>
 
 #include <atomic>
 #include <chrono>
@@ -22,6 +26,8 @@
 #include "decoder.h"
 #include "log.h"
 #include "renderer.h"
+#include "settings.h"
+#include "transfer.h"
 #include "util.h"
 
 extern "C" {
@@ -36,10 +42,23 @@ constexpr UINT WM_APP_VIDEO_SIZE = WM_APP + 1;
 constexpr UINT WM_APP_FPS = WM_APP + 2;
 constexpr UINT WM_APP_DISCONNECTED = WM_APP + 3;
 constexpr UINT WM_APP_CLIPBOARD = WM_APP + 4;
+constexpr UINT WM_APP_CONNECTED = WM_APP + 5;
+constexpr UINT WM_APP_STATUS = WM_APP + 6;   // lParam: new std::wstring, wParam: 1 = geçici
+constexpr UINT WM_APP_WAITING = WM_APP + 7;  // lParam: new std::wstring (bekleme sebebi)
 constexpr UINT_PTR kTimeLimitTimer = 1;
+constexpr UINT_PTR kStatusTimer = 2;
+
+// Başlık çubuğu menüsü (WM_SYSCOMMAND: alt 4 bit sisteme ayrılmış, kimlikler 16'nın katı)
+constexpr UINT IDM_PROFILE_BASE = 0x0100;  // + i * 0x10
+constexpr UINT IDM_TOPMOST = 0x0200;
+constexpr UINT IDM_SCREEN = 0x0210;
+constexpr UINT IDM_SEND_FILE = 0x0220;
+constexpr UINT IDM_RECONNECT = 0x0230;
 
 struct Options {
     SessionOptions session;
+    bool custom_bit_rate = false;  // komut satırı profili ezer
+    bool custom_max_size = false;
     int time_limit = 0;  // saniye, test için
 };
 
@@ -80,6 +99,26 @@ int g_nav_pressed = -1;
 
 std::mutex g_clip_mutex;
 std::string g_last_clip_sent;  // telefonun bize geri yankıladığı panoyu yok saymak için
+
+Settings g_settings;
+Options g_opt;
+
+// Bağlantı yönetimi
+std::mutex g_conn_mutex;
+std::condition_variable g_conn_cv;
+std::atomic<bool> g_reconnect{false};   // profil değişti: oturumu kapatıp hemen yeniden bağlan
+std::atomic<bool> g_connected{false};
+
+// Ana thread'in gösterdiği durum
+std::wstring g_device_name;  // son bağlanılan cihaz
+std::wstring g_serial;
+std::wstring g_wait_reason;  // bağlı değilken başlıkta gösterilir
+std::wstring g_status;       // geçici durum mesajı (dosya aktarımı vb.)
+
+void post_text(UINT msg, std::wstring text, WPARAM wp = 0) {
+    auto* s = new std::wstring(std::move(text));
+    if (!PostMessageW(g_hwnd, msg, wp, reinterpret_cast<LPARAM>(s))) delete s;
+}
 
 // ---------------------------------------------------------------- render
 
@@ -153,13 +192,14 @@ AVCodecID codec_from_id(uint32_t id) {
     }
 }
 
-void video_thread_fn() {
+// Bir oturum boyunca video paketlerini okur ve çözer; bağlantı kopunca döner.
+void video_loop() {
     constexpr uint64_t kFlagConfig = uint64_t(1) << 62;
     constexpr uint64_t kFlagKey = uint64_t(1) << 61;
     std::vector<uint8_t> config;
     uint8_t hdr[12];
 
-    while (!g_quit) {
+    while (!g_quit && !g_reconnect) {
         if (!g_session.recv_video(hdr, sizeof hdr)) break;
 
         if (hdr[0] & 0x80) {
@@ -205,7 +245,6 @@ void video_thread_fn() {
         g_decoder.decode(pkt, push_frame);
         av_packet_free(&pkt);
     }
-    if (!g_quit) PostMessageW(g_hwnd, WM_APP_DISCONNECTED, 0, 0);
 }
 
 // ---------------------------------------------------------------- pano
@@ -276,6 +315,100 @@ void device_msg_thread_fn() {
             break;
         }
     }
+}
+
+// ---------------------------------------------------------------- bağlantı yönetimi
+
+SessionOptions current_session_options() {
+    std::lock_guard lk(g_conn_mutex);
+    SessionOptions o = g_opt.session;
+    const Profile& p = kProfiles[g_settings.profile];
+    if (!g_opt.custom_bit_rate) o.bit_rate = p.bit_rate;
+    if (!g_opt.custom_max_size) o.max_size = p.max_size;
+    return o;
+}
+
+// `ms` kadar bekler; kapanış ya da yeniden bağlanma isteği gelirse hemen döner
+void wait_or_wake(std::chrono::milliseconds ms) {
+    std::unique_lock lk(g_conn_mutex);
+    g_conn_cv.wait_for(lk, ms, [] { return g_quit.load() || g_reconnect.load(); });
+}
+
+// Telefonu bekler, bağlanır, oturum bitince tekrar dener. Pencere hiç kapanmaz.
+void connection_thread_fn() {
+    std::string last_error;
+    while (!g_quit) {
+        g_reconnect = false;
+        std::string err;
+        Session::Result r = g_session.start(current_session_options(), g_quit, &err);
+        if (g_quit) { g_session.stop(); break; }
+
+        if (r != Session::Result::Ok) {
+            if (err != last_error) {
+                LOGW("%s", err.c_str());
+                last_error = err;
+                std::wstring reason = r == Session::Result::NoDevice
+                                          ? L"Telefon bekleniyor (USB kablosu ve USB hata ayıklama)"
+                                          : L"Bağlanamadı, tekrar deneniyor";
+                if (err.find("yetkisiz") != std::string::npos) reason = L"Telefonda USB hata ayıklama iznini onayla";
+                post_text(WM_APP_WAITING, reason);
+            }
+            wait_or_wake(1500ms);
+            continue;
+        }
+        last_error.clear();
+
+        // Akışın başı: codec id (4 bayt) + ilk oturum paketi (12 bayt)
+        uint8_t buf[12];
+        AVCodecID codec = AV_CODEC_ID_NONE;
+        bool header_ok = g_session.recv_video(buf, 4);
+        if (header_ok) {
+            uint32_t id = read32be(buf);
+            codec = codec_from_id(id);
+            if (codec == AV_CODEC_ID_NONE) LOGE("Telefon video akışını başlatamadı (kod 0x%08x)", id);
+        }
+        header_ok = header_ok && codec != AV_CODEC_ID_NONE && g_session.recv_video(buf, 12) && (buf[0] & 0x80);
+        if (!header_ok || !g_decoder.open(codec, g_renderer.device(), &g_renderer.context_lock())) {
+            g_session.stop();
+            g_decoder.close();
+            post_text(WM_APP_WAITING, L"Video başlatılamadı, tekrar deneniyor");
+            wait_or_wake(3000ms);
+            continue;
+        }
+        int w = int(read32be(buf + 4)), h = int(read32be(buf + 8));
+        g_vw = w;
+        g_vh = h;
+        g_connected = true;
+        g_renderer.set_dimmed(false);
+        auto* info = new std::wstring(to_wide(g_session.device_name()) + L"\n" + g_session.serial());
+        if (!PostMessageW(g_hwnd, WM_APP_CONNECTED, MAKEWPARAM(w, h), reinterpret_cast<LPARAM>(info))) delete info;
+
+        std::thread msg_thread(device_msg_thread_fn);
+        video_loop();
+
+        g_connected = false;
+        g_session.interrupt();  // mesaj thread'ini uyandır
+        msg_thread.join();
+        g_session.stop();
+        g_decoder.close();
+        g_renderer.set_dimmed(true);
+        request_redraw();
+        if (g_quit) break;
+
+        bool requested = g_reconnect.load();
+        LOGW("%s", requested ? "Yeni ayarlarla yeniden bağlanılıyor" : "Telefonla bağlantı koptu, yeniden bağlanılacak");
+        post_text(WM_APP_WAITING, requested ? L"Yeniden bağlanıyor…" : L"Bağlantı koptu, yeniden bağlanıyor…");
+        if (!requested) wait_or_wake(1000ms);
+    }
+}
+
+void request_reconnect() {
+    {
+        std::lock_guard lk(g_conn_mutex);
+        g_reconnect = true;
+    }
+    g_conn_cv.notify_all();
+    g_session.interrupt();
 }
 
 // ---------------------------------------------------------------- giriş
@@ -379,12 +512,131 @@ void on_char(wchar_t ch) {
 }
 
 void update_title() {
-    std::wstring t = L"Köprü — " + to_wide(g_session.device_name());
-    if (g_known_vw) t += L"  |  " + std::to_wstring(g_known_vw) + L"×" + std::to_wstring(g_known_vh);
-    t += L"  |  " + std::to_wstring(g_fps) + L" FPS";
+    std::wstring t = L"Köprü";
+    if (g_connected) {
+        t += L" — " + g_device_name;
+        if (g_known_vw) t += L"  |  " + std::to_wstring(g_known_vw) + L"×" + std::to_wstring(g_known_vh);
+        t += L"  |  " + std::to_wstring(g_fps) + L" FPS";
+        t += L"  |  ";
+        t += (g_opt.custom_bit_rate || g_opt.custom_max_size) ? L"Özel" : kProfiles[g_settings.profile].name;
+        if (!g_phone_screen_on) t += L"  |  Telefon ekranı kapalı";
+    } else {
+        t += L" — " + (g_wait_reason.empty() ? std::wstring(L"Bağlanıyor…") : g_wait_reason);
+    }
     if (g_topmost) t += L"  |  Üstte";
-    if (!g_phone_screen_on) t += L"  |  Telefon ekranı kapalı";
+    if (!g_status.empty()) t += L"  |  " + g_status;
     SetWindowTextW(g_hwnd, t.c_str());
+}
+
+void show_status(const std::wstring& text, bool temporary) {
+    g_status = text;
+    update_title();
+    if (temporary) SetTimer(g_hwnd, kStatusTimer, 4000, nullptr);
+    else KillTimer(g_hwnd, kStatusTimer);
+}
+
+void update_menu() {
+    HMENU m = GetSystemMenu(g_hwnd, FALSE);
+    CheckMenuRadioItem(m, IDM_PROFILE_BASE, IDM_PROFILE_BASE + (kProfileCount - 1) * 0x10,
+                       IDM_PROFILE_BASE + UINT(g_settings.profile) * 0x10, MF_BYCOMMAND);
+    CheckMenuItem(m, IDM_TOPMOST, MF_BYCOMMAND | (g_topmost ? MF_CHECKED : MF_UNCHECKED));
+}
+
+void build_menu() {
+    HMENU m = GetSystemMenu(g_hwnd, FALSE);
+    AppendMenuW(m, MF_SEPARATOR, 0, nullptr);
+    for (int i = 0; i < kProfileCount; ++i) {
+        std::wstring label = L"Profil: " + std::wstring(kProfiles[i].name) + L"\tAlt+" + std::to_wstring(i + 1);
+        AppendMenuW(m, MF_STRING, IDM_PROFILE_BASE + UINT(i) * 0x10, label.c_str());
+    }
+    AppendMenuW(m, MF_SEPARATOR, 0, nullptr);
+    AppendMenuW(m, MF_STRING, IDM_TOPMOST, L"Her zaman üstte\tAlt+T");
+    AppendMenuW(m, MF_STRING, IDM_SCREEN, L"Telefon ekranını kapat / aç\tAlt+O");
+    AppendMenuW(m, MF_STRING, IDM_SEND_FILE, L"Dosya gönder / APK kur…\tAlt+F");
+    AppendMenuW(m, MF_STRING, IDM_RECONNECT, L"Yeniden bağlan");
+    update_menu();
+}
+
+void set_profile(int i) {
+    if (i < 0 || i >= kProfileCount) return;
+    bool custom = g_opt.custom_bit_rate || g_opt.custom_max_size;
+    if (i == g_settings.profile && !custom) return;
+    {
+        std::lock_guard lk(g_conn_mutex);
+        g_settings.profile = i;
+        g_opt.custom_bit_rate = g_opt.custom_max_size = false;  // menüden seçim komut satırını ezer
+    }
+    g_settings.save();
+    update_menu();
+    show_status(L"Profil: " + std::wstring(kProfiles[i].name), true);
+    if (g_connected) request_reconnect();
+}
+
+void set_topmost(bool on) {
+    g_topmost = on;
+    g_settings.topmost = on;
+    g_settings.save();
+    SetWindowPos(g_hwnd, on ? HWND_TOPMOST : HWND_NOTOPMOST, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
+    update_menu();
+    update_title();
+}
+
+void toggle_phone_screen() {
+    if (!g_connected) return;
+    g_phone_screen_on = !g_phone_screen_on;
+    g_session.send_control(ctrl::set_display_power(g_phone_screen_on));
+    update_title();
+}
+
+// ---------------------------------------------------------------- dosya aktarımı
+
+void send_files(std::vector<std::wstring> files) {
+    if (files.empty()) return;
+    if (!g_connected || g_serial.empty()) {
+        show_status(L"Dosya göndermek için telefon bağlı olmalı", true);
+        return;
+    }
+    transfer::start(
+        g_serial, std::move(files),
+        [](const std::wstring& text, bool done) { post_text(WM_APP_STATUS, text, done ? 1 : 0); },
+        [](const std::string& path) { g_session.send_control(ctrl::scan_file(path)); });
+}
+
+void open_file_dialog() {
+    std::wstring buf(32768, L'\0');
+    OPENFILENAMEW ofn{sizeof ofn};
+    ofn.hwndOwner = g_hwnd;
+    ofn.lpstrFilter = L"Tüm dosyalar\0*.*\0Android uygulaması (*.apk)\0*.apk\0";
+    ofn.lpstrFile = buf.data();
+    ofn.nMaxFile = DWORD(buf.size());
+    ofn.lpstrTitle = L"Telefona gönderilecek dosyaları seç (APK'lar kurulur)";
+    ofn.Flags = OFN_ALLOWMULTISELECT | OFN_EXPLORER | OFN_FILEMUSTEXIST;
+    if (!GetOpenFileNameW(&ofn)) return;
+
+    // Çoklu seçimde: klasör\0dosya1\0dosya2\0\0 ; tekli seçimde: tam yol\0\0
+    std::vector<std::wstring> parts;
+    for (const wchar_t* p = buf.c_str(); *p; p += wcslen(p) + 1) parts.emplace_back(p);
+    std::vector<std::wstring> files;
+    if (parts.size() == 1) {
+        files = parts;
+    } else {
+        for (size_t i = 1; i < parts.size(); ++i) files.push_back(parts[0] + L"\\" + parts[i]);
+    }
+    send_files(std::move(files));
+}
+
+void on_drop(HDROP drop) {
+    std::vector<std::wstring> files;
+    UINT n = DragQueryFileW(drop, 0xFFFFFFFF, nullptr, 0);
+    for (UINT i = 0; i < n; ++i) {
+        UINT len = DragQueryFileW(drop, i, nullptr, 0);
+        std::wstring f(len + 1, L'\0');
+        DragQueryFileW(drop, i, f.data(), len + 1);
+        f.resize(len);
+        files.push_back(std::move(f));
+    }
+    DragFinish(drop);
+    send_files(std::move(files));
 }
 
 // Pencereyi video oranında, ekranın %90'ına sığacak şekilde boyutlandır
@@ -457,20 +709,11 @@ bool on_alt_shortcut(WPARAM vk, LPARAM lp) {
             if (!repeat) g_session.send_control(ctrl::simple(shift ? ctrl::COLLAPSE_PANELS : ctrl::EXPAND_NOTIFICATION_PANEL));
             return true;
         case 'R': if (!repeat) g_session.send_control(ctrl::simple(ctrl::ROTATE_DEVICE)); return true;
-        case 'O':
-            if (!repeat) {
-                g_phone_screen_on = !g_phone_screen_on;
-                g_session.send_control(ctrl::set_display_power(g_phone_screen_on));
-                update_title();
-            }
-            return true;
-        case 'T':
-            if (!repeat) {
-                g_topmost = !g_topmost;
-                SetWindowPos(g_hwnd, g_topmost ? HWND_TOPMOST : HWND_NOTOPMOST, 0, 0, 0, 0,
-                             SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
-                update_title();
-            }
+        case 'O': if (!repeat) toggle_phone_screen(); return true;
+        case 'T': if (!repeat) set_topmost(!g_topmost); return true;
+        case 'F': if (!repeat) open_file_dialog(); return true;
+        case '1': case '2': case '3':
+            if (!repeat) set_profile(int(vk - '1'));
             return true;
         default: return false;
     }
@@ -604,6 +847,8 @@ LRESULT CALLBACK video_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             g_session.send_control(ctrl::inject_keycode(msg == WM_MBUTTONDOWN ? ctrl::ACTION_DOWN : ctrl::ACTION_UP,
                                                         ctrl::key::HOME, 0, 0));
             return 0;
+        case WM_DROPFILES:
+            return SendMessageW(g_hwnd, msg, wp, lp);
     }
     return DefWindowProcW(hwnd, msg, wp, lp);
 }
@@ -717,6 +962,59 @@ LRESULT CALLBACK wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             update_title();
             return 0;
         }
+        case WM_APP_CONNECTED: {
+            auto* info = reinterpret_cast<std::wstring*>(lp);
+            size_t nl = info->find(L'\n');
+            g_device_name = info->substr(0, nl);
+            g_serial = nl == std::wstring::npos ? L"" : info->substr(nl + 1);
+            delete info;
+            int w = LOWORD(wp), h = HIWORD(wp);
+            // Pencerenin oranı videoya uymuyorsa (ilk bağlantı, farklı profil/telefon) yeniden boyutla
+            RECT rc;
+            GetClientRect(g_video, &rc);
+            double win_ar = rc.bottom > 0 ? double(rc.right) / rc.bottom : 0;
+            double vid_ar = double(w) / h;
+            g_known_vw = w;
+            g_known_vh = h;
+            if (std::abs(win_ar - vid_ar) > 0.02) fit_window(w, h);
+            g_settings.video_w = w;
+            g_settings.video_h = h;
+            g_phone_screen_on = true;
+            g_wait_reason.clear();
+            update_title();
+            return 0;
+        }
+        case WM_APP_WAITING: {
+            auto* s = reinterpret_cast<std::wstring*>(lp);
+            g_wait_reason = *s;
+            delete s;
+            g_fps = 0;
+            update_title();
+            return 0;
+        }
+        case WM_APP_STATUS: {
+            auto* s = reinterpret_cast<std::wstring*>(lp);
+            show_status(*s, wp == 1);
+            delete s;
+            return 0;
+        }
+        case WM_SYSCOMMAND: {
+            UINT id = UINT(wp & 0xFFF0);
+            if (id >= IDM_PROFILE_BASE && id < IDM_PROFILE_BASE + UINT(kProfileCount) * 0x10) {
+                set_profile(int((id - IDM_PROFILE_BASE) / 0x10));
+                return 0;
+            }
+            switch (id) {
+                case IDM_TOPMOST: set_topmost(!g_topmost); return 0;
+                case IDM_SCREEN: toggle_phone_screen(); return 0;
+                case IDM_SEND_FILE: open_file_dialog(); return 0;
+                case IDM_RECONNECT: request_reconnect(); return 0;
+            }
+            break;
+        }
+        case WM_DROPFILES:
+            on_drop(reinterpret_cast<HDROP>(wp));
+            return 0;
         case WM_APP_FPS:
             g_fps = int(wp);
             update_title();
@@ -727,16 +1025,24 @@ LRESULT CALLBACK wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             delete s;
             return 0;
         }
-        case WM_APP_DISCONNECTED:
-            LOGW("Telefonla bağlantı koptu");
-            DestroyWindow(hwnd);
-            return 0;
         case WM_TIMER:
             if (wp == kTimeLimitTimer) DestroyWindow(hwnd);
+            if (wp == kStatusTimer) {
+                KillTimer(hwnd, kStatusTimer);
+                g_status.clear();
+                update_title();
+            }
             return 0;
-        case WM_DESTROY:
+        case WM_DESTROY: {
+            WINDOWPLACEMENT wpl{sizeof wpl};
+            if (GetWindowPlacement(hwnd, &wpl)) {
+                g_settings.window = wpl.rcNormalPosition;
+                g_settings.has_window = true;
+            }
+            g_settings.save();
             PostQuitMessage(0);
             return 0;
+        }
     }
     return DefWindowProcW(hwnd, msg, wp, lp);
 }
@@ -745,14 +1051,16 @@ void print_help() {
     std::fputs(
         "Kullanim: kopru [secenekler]\n"
         "  --serial SERI      Birden fazla cihaz varsa hangisi\n"
-        "  --bit-rate MBPS    Video bit hizi (varsayilan 8)\n"
+        "  --bit-rate MBPS    Video bit hizi (profili ezer)\n"
         "  --max-fps N        En fazla FPS (varsayilan 60)\n"
-        "  --max-size N       En uzun kenari N pikselle sinirla (ornek 1280)\n"
+        "  --max-size N       En uzun kenari N pikselle sinirla (profili ezer)\n"
         "  --stay-awake       USB takiliyken telefon ekrani kapanmasin\n"
         "  --time-limit SN    N saniye sonra kapan (test icin)\n"
-        "\nKisayollar: sag tik=Geri, orta tik=Ana ekran, Alt+H ana ekran, Alt+B geri,\n"
+        "\nProfiller: Alt+1 Hiz (1280p, 4 Mbps), Alt+2 Dengeli (8 Mbps), Alt+3 Kalite (16 Mbps)\n"
+        "Kisayollar: sag tik=Geri, orta tik=Ana ekran, Alt+H ana ekran, Alt+B geri,\n"
         "  Alt+S son uygulamalar, Alt+P guc, Alt+Yukari/Asagi ses, Alt+N bildirimler,\n"
         "  Alt+R dondur, Alt+O telefon ekranini kapat/ac, Alt+T her zaman ustte,\n"
+        "  Alt+F dosya gonder / APK kur (ya da pencereye surukle-birak),\n"
         "  Ctrl+V PC panosunu telefona yapistir, Ctrl+C/X telefondan PC'ye kopyala\n",
         stderr);
 }
@@ -764,9 +1072,13 @@ bool parse_args(int argc, wchar_t** argv, Options& o) {
         if (a == L"--help" || a == L"-h") { print_help(); return false; }
         else if (a == L"--stay-awake") o.session.stay_awake = true;
         else if (a == L"--serial") { if (auto v = next()) o.session.serial = v; }
-        else if (a == L"--bit-rate") { if (auto v = next()) o.session.bit_rate = uint32_t(_wtof(v) * 1'000'000); }
+        else if (a == L"--bit-rate") {
+            if (auto v = next()) { o.session.bit_rate = uint32_t(_wtof(v) * 1'000'000); o.custom_bit_rate = true; }
+        }
         else if (a == L"--max-fps") { if (auto v = next()) o.session.max_fps = uint32_t(_wtoi(v)); }
-        else if (a == L"--max-size") { if (auto v = next()) o.session.max_size = uint32_t(_wtoi(v)); }
+        else if (a == L"--max-size") {
+            if (auto v = next()) { o.session.max_size = uint32_t(_wtoi(v)); o.custom_max_size = true; }
+        }
         else if (a == L"--time-limit") { if (auto v = next()) o.time_limit = _wtoi(v); }
         else { LOGE("Bilinmeyen seçenek: %s", to_utf8(a).c_str()); print_help(); return false; }
     }
@@ -779,8 +1091,8 @@ int wmain(int argc, wchar_t** argv) {
     SetConsoleOutputCP(CP_UTF8);
     SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
 
-    Options opt;
-    if (!parse_args(argc, argv, opt)) return 1;
+    if (!parse_args(argc, argv, g_opt)) return 1;
+    g_settings.load();
 
     WSADATA wsa;
     WSAStartup(MAKEWORD(2, 2), &wsa);
@@ -811,41 +1123,28 @@ int wmain(int argc, wchar_t** argv) {
     g_video = CreateWindowExW(0, vc.lpszClassName, nullptr, WS_CHILD | WS_VISIBLE, 0, 0, rc.right,
                               std::max<LONG>(1, rc.bottom - g_bar_h), g_hwnd, nullptr, inst, nullptr);
     if (!g_video || !g_renderer.init(g_video)) return 1;
+    DragAcceptFiles(g_hwnd, TRUE);
+    DragAcceptFiles(g_video, TRUE);
+    build_menu();
 
+    // Pencere telefon bağlanmadan açılır: son konum ya da son video boyutuna göre
     auto t0 = std::chrono::steady_clock::now();
-    if (!g_session.start(opt.session)) return 1;
-
-    // Video akışının başı: codec id (4 bayt) + ilk oturum paketi (12 bayt)
-    uint8_t buf[12];
-    if (!g_session.recv_video(buf, 4)) { LOGE("Video akışı başlamadı"); g_session.stop(); return 1; }
-    uint32_t codec_id = read32be(buf);
-    if (codec_id == 0 || codec_id == 1) {
-        LOGE("Telefon video akışını başlatamadı (kod %u). Konsoldaki [server] mesajlarına bak.", codec_id);
-        g_session.stop();
-        return 1;
+    g_known_vw = g_settings.video_w;
+    g_known_vh = g_settings.video_h;
+    if (g_settings.has_window && MonitorFromRect(&g_settings.window, MONITOR_DEFAULTTONULL)) {
+        const RECT& r = g_settings.window;
+        SetWindowPos(g_hwnd, nullptr, r.left, r.top, r.right - r.left, r.bottom - r.top, SWP_NOZORDER | SWP_NOACTIVATE);
+    } else {
+        fit_window(g_known_vw, g_known_vh);
     }
-    AVCodecID codec = codec_from_id(codec_id);
-    if (codec == AV_CODEC_ID_NONE) { LOGE("Bilinmeyen codec 0x%08x", codec_id); g_session.stop(); return 1; }
-    if (!g_session.recv_video(buf, 12) || !(buf[0] & 0x80)) { LOGE("Oturum bilgisi alınamadı"); g_session.stop(); return 1; }
-    g_known_vw = g_vw = int(read32be(buf + 4));
-    g_known_vh = g_vh = int(read32be(buf + 8));
-    LOGI("Video: %dx%d", g_known_vw, g_known_vh);
-
-    if (!g_decoder.open(codec, g_renderer.device(), &g_renderer.context_lock())) {
-        g_session.stop();
-        return 1;
-    }
-
-    fit_window(g_known_vw, g_known_vh);
     update_title();
     ShowWindow(g_hwnd, SW_SHOW);
-    LOGI("Hazır (%lld ms)",
-         static_cast<long long>(std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - t0).count()));
+    if (g_settings.topmost) set_topmost(true);
 
     std::thread render_thread(render_thread_fn);
-    std::thread video_thread(video_thread_fn);
-    std::thread msg_thread(device_msg_thread_fn);
-    if (opt.time_limit > 0) SetTimer(g_hwnd, kTimeLimitTimer, UINT(opt.time_limit * 1000), nullptr);
+    std::atomic<bool> conn_done{false};
+    std::thread conn_thread([&] { connection_thread_fn(); conn_done = true; });
+    if (g_opt.time_limit > 0) SetTimer(g_hwnd, kTimeLimitTimer, UINT(g_opt.time_limit * 1000), nullptr);
 
     MSG m;
     while (GetMessageW(&m, nullptr, 0, 0) > 0) {
@@ -853,16 +1152,26 @@ int wmain(int argc, wchar_t** argv) {
         DispatchMessageW(&m);
     }
 
-    // Kapanış: soketleri kapatmak okuma thread'lerini uyandırır
-    g_quit = true;
-    g_session.stop();
-    video_thread.join();
-    msg_thread.join();
+    // Kapanış: bağlantı thread'ini uyandır, soketleri kapat
+    {
+        std::lock_guard lk(g_conn_mutex);
+        g_quit = true;
+    }
+    g_conn_cv.notify_all();
+    g_session.interrupt();
+    // adb komutu ortasındaysa en fazla 5 sn bekle; sonra süreci zaten kapatıyoruz
+    for (int i = 0; i < 50 && !conn_done; ++i) Sleep(100);
+    bool clean = conn_done.load();
+    if (clean) conn_thread.join(); else conn_thread.detach();
     { std::lock_guard lk(g_rq.m); g_rq.quit = true; }
     g_rq.cv.notify_one();
     render_thread.join();
     if (g_rq.frame) av_frame_free(&g_rq.frame);
-    g_decoder.close();
+    if (!clean) {
+        LOGW("Bağlantı thread'i zamanında kapanmadı, çıkılıyor");
+        std::fflush(stderr);
+        TerminateProcess(GetCurrentProcess(), 0);
+    }
 
     double secs = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
     LOGI("Özet: %.1f sn, %llu paket, %.1f MB (ort. %.1f Mbps), çözülen %llu, gösterilen %llu, atlanan %llu",

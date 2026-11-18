@@ -32,6 +32,23 @@ adb şu sırayla aranır: `KOPRU_ADB` ortam değişkeni, `ANDROID_HOME`/`ANDROID
 
 Seçenekler: `kopru --help`
 
+Program telefon takılı olmadan da açılır ve bekler; kablo çıkarılır ya da bağlantı koparsa
+telefon geri geldiğinde kendiliğinden yeniden bağlanır.
+
+**Profiller** (Alt+1/2/3 ya da başlık çubuğu menüsü, çalışırken değişir):
+
+| Profil | Çözünürlük | Bit hızı |
+|---|---|---|
+| Hız | en uzun kenar 1280 | 4 Mbps |
+| Dengeli (varsayılan) | tam | 8 Mbps |
+| Kalite | tam | 16 Mbps |
+
+**Dosya gönderme:** Dosyaları pencereye sürükle-bırak ya da Alt+F. `.apk` dosyaları telefona kurulur,
+diğerleri telefonun `Download` klasörüne gider ve galeride/dosyalarda görünür.
+
+Profil, "her zaman üstte" ve pencere konumu `%APPDATA%\Kopru\kopru.ini` dosyasında saklanır.
+Pencere simgesine tıklayınca (ya da Alt+Boşluk) açılan menüde tüm seçenekler var.
+
 Pencerenin altında Android gezinme çubuğu var (□ son uygulamalar, ○ ana ekran, ◁ geri). Fiziksel
 tuşlu telefonlarda bu tuşlar ekranda görünmediği için eklendi. Basılı tutma da telefona iletilir.
 
@@ -48,6 +65,8 @@ tuşlu telefonlarda bu tuşlar ekranda görünmediği için eklendi. Basılı tu
 | Alt+R | Ekranı döndür |
 | Alt+O | Telefon ekranını kapat / aç (yansıtma devam eder) |
 | Alt+T | Pencere her zaman üstte |
+| Alt+1 / Alt+2 / Alt+3 | Profil: Hız / Dengeli / Kalite |
+| Alt+F | Dosya gönder / APK kur |
 | Ctrl+V | PC panosunu telefona yapıştır |
 | Ctrl+C / Ctrl+X | Telefonda kopyala/kes, PC panosuna al |
 
@@ -62,4 +81,3 @@ alınmıştır ve Apache 2.0 lisansı altındadır (`third_party/scrcpy-server/L
 ## Bilinen sınırlar
 
 - Android 10 altında ses aktarımı yok (Android'in API sınırı).
-- Bağlantı koparsa program kapanır; otomatik yeniden bağlanma Faz 2'de.

@@ -22,6 +22,8 @@ cbuffer Constants : register(b0) {
     float  y_offset;
     float  y_scale;
     float4 coef;
+    float  brightness;
+    float3 pad;
 };
 Texture2D<float>  tex_y  : register(t0);
 Texture2D<float2> tex_uv : register(t1);
@@ -44,7 +46,7 @@ float4 ps_main(VSOut i) : SV_Target {
     float3 rgb = float3(y + coef.x * c.y,
                         y - coef.y * c.x - coef.z * c.y,
                         y + coef.w * c.x);
-    return float4(saturate(rgb), 1);
+    return float4(saturate(rgb) * brightness, 1);
 }
 )";
 
@@ -288,6 +290,7 @@ void Renderer::draw() {
             D3D11_VIEWPORT vp{float(r.x), float(r.y), float(r.w), float(r.h), 0.0f, 1.0f};
             ctx_->RSSetViewports(1, &vp);
 
+            consts_.brightness = dimmed_ ? 0.3f : 1.0f;
             D3D11_MAPPED_SUBRESOURCE m;
             if (SUCCEEDED(ctx_->Map(cbuf_.Get(), 0, D3D11_MAP_WRITE_DISCARD, 0, &m))) {
                 std::memcpy(m.pData, &consts_, sizeof consts_);

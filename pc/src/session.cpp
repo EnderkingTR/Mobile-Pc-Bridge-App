@@ -14,6 +14,7 @@ static constexpr uint16_t kFirstPort = 27183;
 static constexpr uint16_t kLastPort = 27199;
 
 bool Session::recv_all(SOCKET s, void* buf, size_t len) {
+    if (s == INVALID_SOCKET) return false;
     auto* p = static_cast<char*>(buf);
     while (len) {
         int n = recv(s, p, int(std::min<size_t>(len, 1 << 20)), 0);
@@ -25,12 +26,13 @@ bool Session::recv_all(SOCKET s, void* buf, size_t len) {
 }
 
 bool Session::send_control(const std::vector<uint8_t>& msg) {
-    std::lock_guard lk(send_mutex_);
-    if (control_ == INVALID_SOCKET) return false;
+    std::lock_guard lk(sock_mutex_);
+    SOCKET s = control_;
+    if (s == INVALID_SOCKET) return false;
     const char* p = reinterpret_cast<const char*>(msg.data());
     size_t left = msg.size();
     while (left) {
-        int n = send(control_, p, int(left), 0);
+        int n = send(s, p, int(left), 0);
         if (n <= 0) return false;
         p += n;
         left -= size_t(n);
@@ -52,7 +54,13 @@ static SOCKET connect_local(uint16_t port) {
     return s;
 }
 
-bool Session::start(const SessionOptions& o) {
+Session::Result Session::start(const SessionOptions& o, const std::atomic<bool>& abort, std::string* error) {
+    auto fail = [&](const std::string& msg) {
+        if (error) *error = msg;
+        stop();
+        return Result::Failed;
+    };
+
     adb::run({L"start-server"});
 
     serial_ = o.serial;
@@ -60,18 +68,18 @@ bool Session::start(const SessionOptions& o) {
         std::string err;
         serial_ = adb::first_device(&err);
         if (serial_.empty()) {
-            LOGE("%s", err.c_str());
-            return false;
+            if (error) *error = err;
+            return Result::NoDevice;
         }
     }
-    LOGI("Cihaz: %s", to_utf8(serial_).c_str());
 
     // 1) Sunucuyu telefona yükle (exe'nin yanındaki dosya, göreli yol: Türkçe karakterli
     //    klasör adları adb'ye hiç gitmesin)
     std::string out;
     if (adb::run({L"-s", serial_, L"push", L"scrcpy-server", kDeviceServerPath}, &out) != 0) {
-        LOGE("Sunucu telefona yüklenemedi:\n%s", out.c_str());
-        return false;
+        // Kablo tam o anda çıkarıldıysa bu da "cihaz yok" sayılır
+        if (error) *error = "Sunucu telefona yüklenemedi: " + out;
+        return Result::NoDevice;
     }
 
     // 2) adb forward tüneli: PC'deki TCP portu -> telefondaki yerel soket
@@ -87,10 +95,10 @@ bool Session::start(const SessionOptions& o) {
             break;
         }
     }
-    if (!port) {
-        LOGE("adb forward kurulamadı:\n%s", out.c_str());
-        return false;
-    }
+    if (!port) return fail("adb forward kurulamadı: " + out);
+    auto remove_forward = [&] {
+        adb::run({L"-s", serial_, L"forward", L"--remove", L"tcp:" + std::to_wstring(port)});
+    };
 
     // 3) Sunucuyu başlat
     wchar_t scid_arg[32];
@@ -112,75 +120,72 @@ bool Session::start(const SessionOptions& o) {
     if (o.stay_awake) args.push_back(L"stay_awake=true");
 
     server_proc_ = adb::spawn(args);
-    if (!server_proc_) return false;
+    if (!server_proc_) {
+        remove_forward();
+        return fail("Sunucu başlatılamadı");
+    }
 
     // 4) Video soketine bağlan. Forward modunda adb, telefonda dinleyen olmasa bile
     //    bağlantıyı kabul eder; sunucu hazır olunca ilk sokete 1 "dummy" bayt gönderir.
-    for (int attempt = 0; attempt < 100 && video_ == INVALID_SOCKET; ++attempt) {
-        if (WaitForSingleObject(server_proc_, 0) == WAIT_OBJECT_0) {
-            LOGE("Telefondaki sunucu beklenmedik şekilde kapandı");
-            break;
-        }
+    SOCKET video = INVALID_SOCKET;
+    for (int attempt = 0; attempt < 100 && !abort; ++attempt) {
+        if (WaitForSingleObject(server_proc_, 0) == WAIT_OBJECT_0) break;  // sunucu kapandı
         SOCKET s = connect_local(port);
         uint8_t dummy;
         if (s != INVALID_SOCKET && recv_all(s, &dummy, 1)) {
-            video_ = s;
+            video = s;
             break;
         }
         if (s != INVALID_SOCKET) closesocket(s);
         Sleep(100);
     }
-    if (video_ == INVALID_SOCKET) {
-        LOGE("Video soketine bağlanılamadı");
-        adb::run({L"-s", serial_, L"forward", L"--remove", L"tcp:" + std::to_wstring(port)});
-        stop();
-        return false;
+    if (video == INVALID_SOCKET) {
+        remove_forward();
+        return fail(abort ? "İptal edildi" : "Video soketine bağlanılamadı");
     }
 
     // Sunucu, cihaz bilgisini ancak tüm soketler kabul edildikten sonra gönderir
-    control_ = connect_local(port);
-    if (control_ == INVALID_SOCKET) {
-        LOGE("Kontrol soketine bağlanılamadı");
-        stop();
-        return false;
+    SOCKET control = connect_local(port);
+    {
+        std::lock_guard lk(sock_mutex_);
+        video_ = video;
+        control_ = control;
     }
+    remove_forward();  // soketler açıldıktan sonra tünele gerek yok
+    if (control == INVALID_SOCKET) return fail("Kontrol soketine bağlanılamadı");
 
     // Cihaz bilgisi: 64 baytlık cihaz adı
     char name[64];
-    if (!recv_all(video_, name, sizeof name)) {
-        LOGE("Cihaz bilgisi okunamadı");
-        stop();
-        return false;
-    }
+    if (!recv_all(video, name, sizeof name)) return fail("Cihaz bilgisi okunamadı");
     name[63] = '\0';
     device_name_ = name;
 
-    // Soketler açıldıktan sonra tünele gerek yok
-    adb::run({L"-s", serial_, L"forward", L"--remove", L"tcp:" + std::to_wstring(port)});
-
     BOOL nodelay = TRUE;
-    setsockopt(control_, IPPROTO_TCP, TCP_NODELAY, reinterpret_cast<const char*>(&nodelay), sizeof nodelay);
-    setsockopt(video_, IPPROTO_TCP, TCP_NODELAY, reinterpret_cast<const char*>(&nodelay), sizeof nodelay);
+    setsockopt(control, IPPROTO_TCP, TCP_NODELAY, reinterpret_cast<const char*>(&nodelay), sizeof nodelay);
+    setsockopt(video, IPPROTO_TCP, TCP_NODELAY, reinterpret_cast<const char*>(&nodelay), sizeof nodelay);
     int rcvbuf = 4 << 20;
-    setsockopt(video_, SOL_SOCKET, SO_RCVBUF, reinterpret_cast<const char*>(&rcvbuf), sizeof rcvbuf);
+    setsockopt(video, SOL_SOCKET, SO_RCVBUF, reinterpret_cast<const char*>(&rcvbuf), sizeof rcvbuf);
 
-    LOGI("Bağlandı: %s (port %u)", device_name_.c_str(), port);
-    return true;
+    LOGI("Bağlandı: %s (%s, port %u)", device_name_.c_str(), to_utf8(serial_).c_str(), port);
+    return Result::Ok;
+}
+
+void Session::interrupt() {
+    std::lock_guard lk(sock_mutex_);
+    if (SOCKET s = video_; s != INVALID_SOCKET) shutdown(s, SD_BOTH);
+    if (SOCKET s = control_; s != INVALID_SOCKET) shutdown(s, SD_BOTH);
 }
 
 void Session::stop() {
     {
-        std::lock_guard lk(send_mutex_);
-        if (control_ != INVALID_SOCKET) {
-            shutdown(control_, SD_BOTH);
-            closesocket(control_);
-            control_ = INVALID_SOCKET;
+        std::lock_guard lk(sock_mutex_);
+        for (auto* sock : {&video_, &control_}) {
+            SOCKET s = sock->exchange(INVALID_SOCKET);
+            if (s != INVALID_SOCKET) {
+                shutdown(s, SD_BOTH);
+                closesocket(s);
+            }
         }
-    }
-    if (video_ != INVALID_SOCKET) {
-        shutdown(video_, SD_BOTH);
-        closesocket(video_);
-        video_ = INVALID_SOCKET;
     }
     if (server_proc_) {
         // Soketler kapanınca sunucu kendiliğinden çıkar; kısa süre bekle, sonra zorla kapat

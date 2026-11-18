@@ -106,4 +106,10 @@ std::vector<uint8_t> set_display_power(bool on) {
     return std::move(w.b);
 }
 
+std::vector<uint8_t> scan_file(const std::string& device_path) {
+    Writer w(SCAN_FILE);
+    w.str(device_path, 256);
+    return std::move(w.b);
+}
+
 }  // namespace ctrl
