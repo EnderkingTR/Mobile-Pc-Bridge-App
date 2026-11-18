@@ -22,6 +22,7 @@ add_executable(kopru
     pc/src/renderer.cpp
     pc/src/settings.cpp
     pc/src/transfer.cpp
+    pc/src/wifi.cpp
 )
 
 target_include_directories(kopru SYSTEM PRIVATE "${FFMPEG_DIR}/include")

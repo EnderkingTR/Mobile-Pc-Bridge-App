@@ -132,23 +132,36 @@ HANDLE spawn(const std::vector<std::wstring>& args) {
     return pi.hProcess;
 }
 
-std::wstring first_device(std::string* error) {
+std::vector<Device> list_devices() {
+    std::vector<Device> devices;
     std::string out;
-    if (run({L"devices"}, &out) != 0) {
-        if (error) *error = "adb devices başarısız: " + out;
-        return {};
-    }
+    if (run({L"devices"}, &out) != 0) return devices;
     std::istringstream in(out);
     std::string line;
-    bool unauthorized = false;
     while (std::getline(in, line)) {
         if (!line.empty() && line.back() == '\r') line.pop_back();
         auto tab = line.find('\t');
         if (tab == std::string::npos) continue;
-        std::string serial = line.substr(0, tab);
-        std::string state = line.substr(tab + 1);
-        if (state == "device") return to_wide(serial);
-        if (state == "unauthorized") unauthorized = true;
+        devices.push_back({to_wide(line.substr(0, tab)), line.substr(tab + 1)});
+    }
+    return devices;
+}
+
+bool has_usb_device() {
+    for (const auto& d : list_devices())
+        if (!d.network() && d.state == "device") return true;
+    return false;
+}
+
+std::wstring first_device(std::string* error) {
+    auto devices = list_devices();
+    bool unauthorized = false;
+    for (bool want_network : {false, true}) {
+        for (const auto& d : devices) {
+            if (d.network() != want_network) continue;
+            if (d.state == "device") return d.serial;
+            if (d.state == "unauthorized") unauthorized = true;
+        }
     }
     if (error) {
         *error = unauthorized

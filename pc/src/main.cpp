@@ -29,6 +29,7 @@
 #include "settings.h"
 #include "transfer.h"
 #include "util.h"
+#include "wifi.h"
 
 extern "C" {
 #include <libavcodec/avcodec.h>
@@ -45,6 +46,8 @@ constexpr UINT WM_APP_CLIPBOARD = WM_APP + 4;
 constexpr UINT WM_APP_CONNECTED = WM_APP + 5;
 constexpr UINT WM_APP_STATUS = WM_APP + 6;   // lParam: new std::wstring, wParam: 1 = geçici
 constexpr UINT WM_APP_WAITING = WM_APP + 7;  // lParam: new std::wstring (bekleme sebebi)
+constexpr UINT WM_APP_WIFI_IP = WM_APP + 8;  // lParam: new std::wstring (hazırlanan telefon IP'si)
+constexpr UINT WM_APP_DOWNGRADE = WM_APP + 9; // Wi-Fi yavaş: wParam = yeni profil
 constexpr UINT_PTR kTimeLimitTimer = 1;
 constexpr UINT_PTR kStatusTimer = 2;
 
@@ -54,6 +57,7 @@ constexpr UINT IDM_TOPMOST = 0x0200;
 constexpr UINT IDM_SCREEN = 0x0210;
 constexpr UINT IDM_SEND_FILE = 0x0220;
 constexpr UINT IDM_RECONNECT = 0x0230;
+constexpr UINT IDM_WIFI = 0x0240;
 
 struct Options {
     SessionOptions session;
@@ -108,6 +112,41 @@ std::mutex g_conn_mutex;
 std::condition_variable g_conn_cv;
 std::atomic<bool> g_reconnect{false};   // profil değişti: oturumu kapatıp hemen yeniden bağlan
 std::atomic<bool> g_connected{false};
+// Wi-Fi'de ağ yetişemezse profil geçici olarak bu değerin üstüne çıkmaz (kayıtlı tercih değişmez)
+std::atomic<int> g_wifi_profile_cap{kProfileCount - 1};
+std::atomic<int> g_active_profile{1};  // şu anki oturumda gerçekten kullanılan profil
+std::atomic<bool> g_over_wifi{false};
+void request_reconnect();
+
+// Ağ gecikmesi ölçer: her paketin varış zamanı - telefondaki zaman damgası. Bu farkın en
+// küçük değeri "normal" kabul edilir; üstüne binen kısım ağda/arabellekte biriken gecikmedir.
+struct LagMonitor {
+    static constexpr int64_t kInf = INT64_MAX;
+    int64_t cur_min = kInf, prev_min = kInf;
+    std::chrono::steady_clock::time_point window_start = std::chrono::steady_clock::now();
+    std::chrono::steady_clock::time_point high_since{};
+    bool high = false;
+
+    // Gecikme 2 saniye boyunca 350 ms'yi aşarsa true döner
+    bool update(int64_t pts_us) {
+        using namespace std::chrono;
+        auto now = steady_clock::now();
+        int64_t d = duration_cast<microseconds>(now.time_since_epoch()).count() - pts_us;
+        cur_min = std::min(cur_min, d);
+        if (now - window_start > 5s) {  // saat kaymasına karşı taban değeri yavaşça yenile
+            prev_min = cur_min;
+            cur_min = d;
+            window_start = now;
+        }
+        int64_t lag = d - std::min(cur_min, prev_min);
+        if (lag > 350'000) {
+            if (!high) { high = true; high_since = now; }
+            return now - high_since > 2s;
+        }
+        high = false;
+        return false;
+    }
+};
 
 // Ana thread'in gösterdiği durum
 std::wstring g_device_name;  // son bağlanılan cihaz
@@ -198,6 +237,8 @@ void video_loop() {
     constexpr uint64_t kFlagKey = uint64_t(1) << 61;
     std::vector<uint8_t> config;
     uint8_t hdr[12];
+    LagMonitor lag;
+    bool downgraded = false;
 
     while (!g_quit && !g_reconnect) {
         if (!g_session.recv_video(hdr, sizeof hdr)) break;
@@ -241,6 +282,16 @@ void video_loop() {
         }
         if (pts_flags & kFlagKey) pkt->flags |= AV_PKT_FLAG_KEY;
         pkt->pts = int64_t(pts_flags & (kFlagKey - 1));
+
+        // Wi-Fi ağı akışa yetişemiyorsa bir alt profile in (bir oturumda bir kez)
+        if (g_over_wifi && !downgraded && lag.update(pkt->pts) && g_active_profile > 0) {
+            downgraded = true;
+            int next = g_active_profile - 1;
+            g_wifi_profile_cap = next;
+            LOGW("Wi-Fi gecikmesi birikiyor, %s profiline geçiliyor", to_utf8(kProfiles[next].name).c_str());
+            PostMessageW(g_hwnd, WM_APP_DOWNGRADE, WPARAM(next), 0);
+            request_reconnect();
+        }
 
         g_decoder.decode(pkt, push_frame);
         av_packet_free(&pkt);
@@ -322,10 +373,20 @@ void device_msg_thread_fn() {
 SessionOptions current_session_options() {
     std::lock_guard lk(g_conn_mutex);
     SessionOptions o = g_opt.session;
-    const Profile& p = kProfiles[g_settings.profile];
+    o.wifi_enabled = g_settings.wifi_enabled;
+    o.wifi_ip = g_settings.wifi_ip;
+    return o;
+}
+
+// Cihaz seçildikten sonra çağrılır: profil, bağlantı türüne göre belirlenir
+void apply_profile(SessionOptions& o, bool over_wifi) {
+    std::lock_guard lk(g_conn_mutex);
+    int profile = g_settings.profile;
+    if (over_wifi) profile = std::min(profile, g_wifi_profile_cap.load());
+    g_active_profile = profile;
+    const Profile& p = kProfiles[profile];
     if (!g_opt.custom_bit_rate) o.bit_rate = p.bit_rate;
     if (!g_opt.custom_max_size) o.max_size = p.max_size;
-    return o;
 }
 
 // `ms` kadar bekler; kapanış ya da yeniden bağlanma isteği gelirse hemen döner
@@ -340,16 +401,20 @@ void connection_thread_fn() {
     while (!g_quit) {
         g_reconnect = false;
         std::string err;
-        Session::Result r = g_session.start(current_session_options(), g_quit, &err);
+        SessionOptions so = current_session_options();
+        Session::Result r = g_session.start(so, apply_profile, g_quit, &err);
         if (g_quit) { g_session.stop(); break; }
 
         if (r != Session::Result::Ok) {
             if (err != last_error) {
                 LOGW("%s", err.c_str());
                 last_error = err;
-                std::wstring reason = r == Session::Result::NoDevice
-                                          ? L"Telefon bekleniyor (USB kablosu ve USB hata ayıklama)"
-                                          : L"Bağlanamadı, tekrar deneniyor";
+                std::wstring reason = L"Bağlanamadı, tekrar deneniyor";
+                if (r == Session::Result::NoDevice) {
+                    reason = so.wifi_enabled && !so.wifi_ip.empty()
+                                 ? L"Telefon bekleniyor (USB ya da Wi-Fi " + so.wifi_ip + L")"
+                                 : L"Telefon bekleniyor (USB kablosu ve USB hata ayıklama)";
+                }
                 if (err.find("yetkisiz") != std::string::npos) reason = L"Telefonda USB hata ayıklama iznini onayla";
                 post_text(WM_APP_WAITING, reason);
             }
@@ -357,6 +422,8 @@ void connection_thread_fn() {
             continue;
         }
         last_error.clear();
+        if (!g_session.prepared_wifi_ip().empty()) post_text(WM_APP_WIFI_IP, g_session.prepared_wifi_ip());
+        g_over_wifi = g_session.over_wifi();
 
         // Akışın başı: codec id (4 bayt) + ilk oturum paketi (12 bayt)
         uint8_t buf[12];
@@ -381,14 +448,39 @@ void connection_thread_fn() {
         g_connected = true;
         g_renderer.set_dimmed(false);
         auto* info = new std::wstring(to_wide(g_session.device_name()) + L"\n" + g_session.serial());
+        LOGI("Profil: %s%s", to_utf8(kProfiles[g_active_profile].name).c_str(),
+             g_session.over_wifi() && g_active_profile < g_settings.profile ? " (Wi-Fi için düşürüldü)" : "");
         if (!PostMessageW(g_hwnd, WM_APP_CONNECTED, MAKEWPARAM(w, h), reinterpret_cast<LPARAM>(info))) delete info;
 
         std::thread msg_thread(device_msg_thread_fn);
+        // Wi-Fi'deyken kablo takılırsa daha hızlı olan USB'ye geç
+        std::thread usb_watch;
+        if (g_session.over_wifi() && g_opt.session.serial.empty()) {  // --serial sabitse geçiş yok
+            usb_watch = std::thread([] {
+                for (;;) {
+                    {
+                        std::unique_lock lk(g_conn_mutex);
+                        if (g_conn_cv.wait_for(lk, 3s, [] { return g_quit || g_reconnect || !g_connected; })) return;
+                    }
+                    if (adb::has_usb_device()) {
+                        LOGI("USB kablosu takıldı, USB'ye geçiliyor");
+                        post_text(WM_APP_STATUS, L"USB'ye geçiliyor", 1);
+                        request_reconnect();
+                        return;
+                    }
+                }
+            });
+        }
         video_loop();
 
-        g_connected = false;
+        {
+            std::lock_guard lk(g_conn_mutex);
+            g_connected = false;
+        }
+        g_conn_cv.notify_all();
         g_session.interrupt();  // mesaj thread'ini uyandır
         msg_thread.join();
+        if (usb_watch.joinable()) usb_watch.join();
         g_session.stop();
         g_decoder.close();
         g_renderer.set_dimmed(true);
@@ -518,7 +610,8 @@ void update_title() {
         if (g_known_vw) t += L"  |  " + std::to_wstring(g_known_vw) + L"×" + std::to_wstring(g_known_vh);
         t += L"  |  " + std::to_wstring(g_fps) + L" FPS";
         t += L"  |  ";
-        t += (g_opt.custom_bit_rate || g_opt.custom_max_size) ? L"Özel" : kProfiles[g_settings.profile].name;
+        t += (g_opt.custom_bit_rate || g_opt.custom_max_size) ? L"Özel" : kProfiles[g_active_profile].name;
+        t += g_over_wifi ? L"  |  Wi-Fi" : L"  |  USB";
         if (!g_phone_screen_on) t += L"  |  Telefon ekranı kapalı";
     } else {
         t += L" — " + (g_wait_reason.empty() ? std::wstring(L"Bağlanıyor…") : g_wait_reason);
@@ -540,6 +633,7 @@ void update_menu() {
     CheckMenuRadioItem(m, IDM_PROFILE_BASE, IDM_PROFILE_BASE + (kProfileCount - 1) * 0x10,
                        IDM_PROFILE_BASE + UINT(g_settings.profile) * 0x10, MF_BYCOMMAND);
     CheckMenuItem(m, IDM_TOPMOST, MF_BYCOMMAND | (g_topmost ? MF_CHECKED : MF_UNCHECKED));
+    CheckMenuItem(m, IDM_WIFI, MF_BYCOMMAND | (g_settings.wifi_enabled ? MF_CHECKED : MF_UNCHECKED));
 }
 
 void build_menu() {
@@ -554,7 +648,28 @@ void build_menu() {
     AppendMenuW(m, MF_STRING, IDM_SCREEN, L"Telefon ekranını kapat / aç\tAlt+O");
     AppendMenuW(m, MF_STRING, IDM_SEND_FILE, L"Dosya gönder / APK kur…\tAlt+F");
     AppendMenuW(m, MF_STRING, IDM_RECONNECT, L"Yeniden bağlan");
+    AppendMenuW(m, MF_SEPARATOR, 0, nullptr);
+    AppendMenuW(m, MF_STRING, IDM_WIFI, L"Kablosuz bağlantı (Wi-Fi)");
     update_menu();
+}
+
+void set_wifi(bool on) {
+    {
+        std::lock_guard lk(g_conn_mutex);
+        g_settings.wifi_enabled = on;
+    }
+    g_settings.save();
+    update_menu();
+    if (on) {
+        show_status(g_connected && !g_over_wifi ? L"Wi-Fi hazırlanıyor…" : L"Wi-Fi açık: telefonu bir kez USB ile bağla",
+                    true);
+        if (g_connected && !g_over_wifi) request_reconnect();  // hazırlık oturum başında yapılıyor
+    } else {
+        show_status(L"Wi-Fi kapatıldı", true);
+        std::wstring ip = g_settings.wifi_ip;
+        std::thread([ip] { wifi::disconnect(ip); }).detach();
+        if (g_over_wifi) request_reconnect();
+    }
 }
 
 void set_profile(int i) {
@@ -565,6 +680,7 @@ void set_profile(int i) {
         std::lock_guard lk(g_conn_mutex);
         g_settings.profile = i;
         g_opt.custom_bit_rate = g_opt.custom_max_size = false;  // menüden seçim komut satırını ezer
+        g_wifi_profile_cap = kProfileCount - 1;                 // elle seçim Wi-Fi sınırını da kaldırır
     }
     g_settings.save();
     update_menu();
@@ -1009,9 +1125,26 @@ LRESULT CALLBACK wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                 case IDM_SCREEN: toggle_phone_screen(); return 0;
                 case IDM_SEND_FILE: open_file_dialog(); return 0;
                 case IDM_RECONNECT: request_reconnect(); return 0;
+                case IDM_WIFI: set_wifi(!g_settings.wifi_enabled); return 0;
             }
             break;
         }
+        case WM_APP_WIFI_IP: {
+            auto* s = reinterpret_cast<std::wstring*>(lp);
+            if (*s != g_settings.wifi_ip) {
+                {
+                    std::lock_guard lk(g_conn_mutex);
+                    g_settings.wifi_ip = *s;
+                }
+                g_settings.save();
+                show_status(L"Wi-Fi hazır: " + *s + L" (kabloyu çıkarabilirsin)", true);
+            }
+            delete s;
+            return 0;
+        }
+        case WM_APP_DOWNGRADE:
+            show_status(L"Wi-Fi yavaş: " + std::wstring(kProfiles[int(wp)].name) + L" profiline geçildi", true);
+            return 0;
         case WM_DROPFILES:
             on_drop(reinterpret_cast<HDROP>(wp));
             return 0;

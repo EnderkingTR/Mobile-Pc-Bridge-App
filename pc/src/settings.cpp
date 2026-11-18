@@ -34,6 +34,10 @@ void Settings::load() {
     if (video_w <= 0 || video_h <= 0) { video_w = 1080; video_h = 1920; }
     window = {get(p, L"x", 0), get(p, L"y", 0), get(p, L"x", 0) + get(p, L"w", 0), get(p, L"y", 0) + get(p, L"h", 0)};
     has_window = window.right - window.left > 100 && window.bottom - window.top > 100;
+    wifi_enabled = get(p, L"wifi", 0) != 0;
+    wchar_t ip[64] = {};
+    GetPrivateProfileStringW(L"kopru", L"wifi_ip", L"", ip, 64, p.c_str());
+    wifi_ip = ip;
 }
 
 void Settings::save() const {
@@ -43,6 +47,8 @@ void Settings::save() const {
     put(p, L"topmost", topmost ? 1 : 0);
     put(p, L"video_w", video_w);
     put(p, L"video_h", video_h);
+    put(p, L"wifi", wifi_enabled ? 1 : 0);
+    WritePrivateProfileStringW(L"kopru", L"wifi_ip", wifi_ip.c_str(), p.c_str());
     if (has_window) {
         put(p, L"x", window.left);
         put(p, L"y", window.top);

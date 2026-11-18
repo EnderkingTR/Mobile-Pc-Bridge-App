@@ -3,6 +3,7 @@
 
 #include <cstdint>
 #include <iterator>
+#include <string>
 
 // Kalite profilleri: çalışırken değiştirilebilir (sunucu yeni ayarla yeniden başlar)
 struct Profile {
@@ -24,6 +25,8 @@ struct Settings {
     RECT window{};          // son pencere konumu/boyutu
     bool has_window = false;
     int video_w = 1080, video_h = 1920;  // son görülen video boyutu (telefon bağlanmadan pencere boyu için)
+    bool wifi_enabled = false;
+    std::wstring wifi_ip;                // son bilinen telefon IP'si
 
     void load();
     void save() const;

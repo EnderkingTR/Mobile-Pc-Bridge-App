@@ -46,7 +46,14 @@ telefon geri geldiğinde kendiliğinden yeniden bağlanır.
 **Dosya gönderme:** Dosyaları pencereye sürükle-bırak ya da Alt+F. `.apk` dosyaları telefona kurulur,
 diğerleri telefonun `Download` klasörüne gider ve galeride/dosyalarda görünür.
 
-Profil, "her zaman üstte" ve pencere konumu `%APPDATA%\Kopru\kopru.ini` dosyasında saklanır.
+**Kablosuz (Wi-Fi):** Menüden "Kablosuz bağlantı (Wi-Fi)" seçeneğini bir kez aç. Telefon USB'deyken
+Köprü onu kablosuz moda alır (`adb tcpip 5555`) ve IP'sini kaydeder; kabloyu çıkarınca yansıtma
+Wi-Fi'den devam eder, tekrar takınca USB'ye geri döner. Başlıkta hangi bağlantının kullanıldığı yazar.
+Wi-Fi'de gecikme birikirse geçici olarak bir alt profile inilir (kayıtlı tercih değişmez). Telefon ve
+bilgisayar aynı ağda olmalı. Android 11 altında kablosuz mod telefon yeniden başlayınca kapanır;
+o zaman bir kez USB ile takmak yeterli.
+
+Profil, Wi-Fi tercihi, "her zaman üstte" ve pencere konumu `%APPDATA%\Kopru\kopru.ini` dosyasında saklanır.
 Pencere simgesine tıklayınca (ya da Alt+Boşluk) açılan menüde tüm seçenekler var.
 
 Pencerenin altında Android gezinme çubuğu var (□ son uygulamalar, ○ ana ekran, ◁ geri). Fiziksel

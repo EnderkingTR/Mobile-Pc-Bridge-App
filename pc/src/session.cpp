@@ -8,6 +8,7 @@
 #include "adb.h"
 #include "log.h"
 #include "util.h"
+#include "wifi.h"
 
 static constexpr wchar_t kDeviceServerPath[] = L"/data/local/tmp/scrcpy-server.jar";
 static constexpr uint16_t kFirstPort = 27183;
@@ -54,7 +55,8 @@ static SOCKET connect_local(uint16_t port) {
     return s;
 }
 
-Session::Result Session::start(const SessionOptions& o, const std::atomic<bool>& abort, std::string* error) {
+Session::Result Session::start(SessionOptions o, const OptionsAdjuster& adjust, const std::atomic<bool>& abort,
+                               std::string* error) {
     auto fail = [&](const std::string& msg) {
         if (error) *error = msg;
         stop();
@@ -62,16 +64,27 @@ Session::Result Session::start(const SessionOptions& o, const std::atomic<bool>&
     };
 
     adb::run({L"start-server"});
+    prepared_ip_.clear();
 
     serial_ = o.serial;
     if (serial_.empty()) {
         std::string err;
         serial_ = adb::first_device(&err);
+        // USB'de telefon yok: Wi-Fi açıksa bilinen IP'ye bağlanmayı dene
+        if (serial_.empty() && o.wifi_enabled && wifi::connect(o.wifi_ip)) serial_ = adb::first_device(&err);
         if (serial_.empty()) {
             if (error) *error = err;
             return Result::NoDevice;
         }
     }
+
+    // USB'deyken Wi-Fi'yi hazırla: kablo çıkınca kesintisiz Wi-Fi'ye geçebilmek için
+    if (o.wifi_enabled && !over_wifi()) {
+        std::string err;
+        prepared_ip_ = wifi::prepare(serial_, abort, &err);
+        if (prepared_ip_.empty()) LOGW("Wi-Fi hazırlanamadı: %s", err.c_str());
+    }
+    if (adjust) adjust(o, over_wifi());
 
     // 1) Sunucuyu telefona yükle (exe'nin yanındaki dosya, göreli yol: Türkçe karakterli
     //    klasör adları adb'ye hiç gitmesin)
@@ -166,7 +179,8 @@ Session::Result Session::start(const SessionOptions& o, const std::atomic<bool>&
     int rcvbuf = 4 << 20;
     setsockopt(video, SOL_SOCKET, SO_RCVBUF, reinterpret_cast<const char*>(&rcvbuf), sizeof rcvbuf);
 
-    LOGI("Bağlandı: %s (%s, port %u)", device_name_.c_str(), to_utf8(serial_).c_str(), port);
+    LOGI("Bağlandı: %s (%s, %s, port %u)", device_name_.c_str(), over_wifi() ? "Wi-Fi" : "USB",
+         to_utf8(serial_).c_str(), port);
     return Result::Ok;
 }
 
